@@ -1,12 +1,10 @@
 # BLV individual-based simulation. No plotting dependency.
 # Hybrid model: exact SSA stochastic events + chronological scheduled events.
-# TODOs preserved: confirm receiving-age-class I_L/I_H assignment, dam-state
-# vertical assignment, immediate oldest-heifer replacement, and non-strict cap.
+# TODOs preserved: confirm receiving-age-class I_L/I_H assignment and dam-state
+# vertical assignment.
 # "eradicated" means undetected under surveillance, not infection-free.
-# All epidemiological defaults below are PLACEHOLDERS.  The intervention
-# defaults implement the agreed hypothetical vaccination scenario: 70% vaccine
-# take, all-or-nothing protection, one lifetime dose, no waning and no effect
-# on animals already infected with BLV.
+# Transmission is herd-wide, with age retained for demography and diagnosis.
+# A vaccine dose takes with a specified probability; successful protection is permanent.
 
 if (!requireNamespace("R6", quietly=TRUE)) 
   stop("Package 'R6' is required.")
@@ -15,7 +13,7 @@ if (!requireNamespace("R6", quietly=TRUE))
 STATES <- c("S","R","I_L","I_H");
 AGE_CLASSES <- c("calf","heifer","cow")
 default_initial_composition <- function(n) { 
-  x <- round(c(calf=.2,heifer=.3)*n); 
+  x <- round(c(calf=.125,heifer=.375)*n); 
   list(calves=x[1],heifers=x[2],cows=n-sum(x)) 
 }
 
@@ -27,24 +25,35 @@ make_params <- function(
     init_heifers=NULL,
     init_cows=NULL,
     init_prevalence=.2,
-    init_LH_ratio=.5,
-    birth_rate=1,
-    prop_female=.5,
-    calf_mortality_rate=.05,
-    heifer_mortality_rate=.03,
-    cow_culling_rate=.25,
+    init_LH_ratio=.70,
+    # Defines whether init_prevalence is applied to cows only (legacy
+    # behaviour) or independently to each starting age class.
+    initial_prevalence_scope="cows_only",
+    female_calf_entry_rate=.38,
+    calf_mortality_rate=.10,
+    heifer_mortality_rate=.08,
+    cow_culling_rate=.34,
     calf_to_heifer_age=.5,
     heifer_to_cow_age=2,
-    vertical_transmission_rate=.1,
+    # A heifer may fill a vacant cow place only when close to first calving.
+    # Default window: 22–24 months.  If no eligible heifer is available,
+    # a replacement cow is purchased.
+    replacement_heifer_min_age=22/12,
+    replacement_heifer_max_age=24/12,
+    target_cows=NULL,
+    perinatal_transmission_rate=.186,
     maternal_waning_rate=NULL,
-    beta_L=c(calf=0,heifer=.3,cow=.5),
-    beta_H=c(calf=0,heifer=.6,cow=1),
-    blv_mortality_rate=c(calf=0,heifer=.01,cow=.05),
+    beta_Snv_LInv=.008722059 * 365,
+    beta_Snv_HInv=.09607751 * 365,
+    beta_Sv_LInv=7.518942e-05,
+    beta_Sv_HInv=.0008282463,
+    beta_Snv_LIv=3.454594e-268,
+    beta_Sv_LIv=2.978069e-270,
+    blv_mortality_rate=c(calf=0,heifer=0,cow=.05),
     external_replacements_tested=TRUE,
     external_prevalence=.15,
     external_LH_ratio=.5,
     surveillance_interval_years=.25,
-    surveillance_sensitivity=.95,
     n_clean_samples_required=3L,
     cap_herd_at_target=TRUE,
 
@@ -52,7 +61,7 @@ make_params <- function(
     # stated efficacy.  NULL means no corrective management.
     corrective_management=NULL,
 
-    corrective_management_efficacy=c(low=.15, medium=.35, high=.60),
+    corrective_management_efficacy=c(CM_0=0,CM_25=.25,CM_50=.50,CM_90=.90,CM_99=.99),
 
     # Test-and-remove intervention.
     testing_enabled=FALSE,
@@ -60,17 +69,22 @@ make_params <- function(
     testing_interval_years=.5,
     testing_target_group="all",
     testing_remove_policy="all_positive",
-    testing_sensitivity=.95,
+    testing_sensitivity_older=.95,
+    testing_sensitivity_calf=.91,
+    surveillance_sensitivity_older=.95,
+    surveillance_sensitivity_calf=.91,
 
-    # Preventive vaccination intervention.  A vaccinated S animal has a
-    # vaccine_efficacy probability of becoming R; I_L and I_H are unchanged.
+    # Coverage is uptake. Vaccine take is all-or-nothing; successful
+    # protection lasts for the remainder of the animal's life.
     vaccination_enabled=FALSE,
 
     vaccination_groups=c("heifer", "cow"),
     vaccination_coverage=1,
     vaccine_efficacy=.70,
     vaccination_initial_campaign=TRUE,
-    seed=12345L
+    seed=12345L,
+    initial_infected_age=NULL,
+    initial_infected_state=NULL
 ) {d<-default_initial_composition(herd_size); 
 if(is.null(init_calves))
   init_calves<-d$calves; 
@@ -78,6 +92,8 @@ if(is.null(init_heifers))
   init_heifers<-d$heifers; 
 if(is.null(init_cows))
   init_cows<-d$cows; 
+if(is.null(target_cows))
+  target_cows<-init_cows;
 as.list(environment())
 }
 
@@ -92,20 +108,52 @@ validate_params <- function(p) {
   )
     stop("Invalid negative size/horizon.")
 
+  # A single introduced infection is an alternative to prevalence-based seeding.
+  if (xor(is.null(p$initial_infected_age), is.null(p$initial_infected_state)))
+    stop("Specify both initial_infected_age and initial_infected_state.")
+  if (!is.null(p$initial_infected_age)) {
+    if (length(p$initial_infected_age)!=1L ||
+        !(p$initial_infected_age %in% AGE_CLASSES))
+      stop("initial_infected_age must be calf, heifer, or cow.")
+    if (length(p$initial_infected_state)!=1L ||
+        !(p$initial_infected_state %in% c("I_L", "I_H")))
+      stop("initial_infected_state must be I_L or I_H.")
+    if (p$init_prevalence != 0)
+      stop("Set init_prevalence=0 when introducing one infected animal.")
+  }
+
+  if (!(p$initial_prevalence_scope %in% c("cows_only", "all_age_groups")))
+    stop("initial_prevalence_scope must be 'cows_only' or 'all_age_groups'.")
+
   if (!is.null(p$corrective_management) &&
       !(p$corrective_management %in% names(p$corrective_management_efficacy)))
-    stop("corrective_management must be NULL, 'low', 'medium', or 'high'.")
+    stop("Unknown corrective_management level.")
 
   if (!is.numeric(p$vaccination_coverage) || length(p$vaccination_coverage) != 1L ||
       is.na(p$vaccination_coverage) || p$vaccination_coverage < 0 || p$vaccination_coverage > 1)
     stop("vaccination_coverage must be a single value from 0 to 1.")
 
-  if (!is.numeric(p$vaccine_efficacy) || length(p$vaccine_efficacy) != 1L ||
-      is.na(p$vaccine_efficacy) || p$vaccine_efficacy < 0 || p$vaccine_efficacy > 1)
-    stop("vaccine_efficacy must be a single value from 0 to 1.")
+  if (length(p$vaccine_efficacy)!=1L || is.na(p$vaccine_efficacy) ||
+      p$vaccine_efficacy<0 || p$vaccine_efficacy>1)
+    stop("vaccine_efficacy must be between 0 and 1.")
 
   if (any(!(p$vaccination_groups %in% AGE_CLASSES)))
     stop("vaccination_groups must contain only calf, heifer, and/or cow.")
+
+  if (length(p$female_calf_entry_rate)!=1L ||
+      is.na(p$female_calf_entry_rate) || p$female_calf_entry_rate<0)
+    stop("female_calf_entry_rate must be nonnegative.")
+
+  if (length(p$target_cows)!=1L || is.na(p$target_cows) ||
+      p$target_cows < 0 || p$target_cows != as.integer(p$target_cows))
+    stop("target_cows must be one nonnegative integer.")
+
+  if (any(!is.finite(c(p$replacement_heifer_min_age,
+                        p$replacement_heifer_max_age))) ||
+      p$replacement_heifer_min_age < 0 ||
+      p$replacement_heifer_max_age < p$replacement_heifer_min_age ||
+      p$replacement_heifer_max_age > p$heifer_to_cow_age)
+    stop("Replacement-heifer ages must be ordered, nonnegative, and end no later than heifer_to_cow_age.")
 
   if (!is.numeric(p$testing_interval_years) || length(p$testing_interval_years) != 1L ||
       p$testing_interval_years <= 0)
@@ -117,9 +165,10 @@ validate_params <- function(p) {
   if (!(p$testing_remove_policy %in% c("all_positive", "high_only")))
     stop("testing_remove_policy must be 'all_positive' or 'high_only'.")
 
-  if (!is.numeric(p$testing_sensitivity) || length(p$testing_sensitivity) != 1L ||
-      is.na(p$testing_sensitivity) || p$testing_sensitivity < 0 || p$testing_sensitivity > 1)
-    stop("testing_sensitivity must be a single value from 0 to 1.")
+  for (nm in c("testing_sensitivity_older", "testing_sensitivity_calf",
+               "surveillance_sensitivity_older", "surveillance_sensitivity_calf"))
+    if (length(p[[nm]]) != 1L || is.na(p[[nm]]) || p[[nm]] < 0 || p[[nm]] > 1)
+      stop(nm, " must be between 0 and 1.")
 }
 
 # Backwards-compatible name used by older baseline scripts.
@@ -458,18 +507,36 @@ schedule_age_up <- function(sim, a) {
 init_population <- function(sim) {
   p <- sim$p
   h <- sim$herd
+
+  initial_states <- function(n, prevalence) {
+    ni <- round(n * prevalence)
+    nl <- round(ni * p$init_LH_ratio)
+    z <- c(rep("S", n - ni), rep("I_L", nl), rep("I_H", ni - nl))
+    if (length(z) > 1L)
+      z <- z[sample.int(length(z))]
+    z
+  }
+
+  prevalence_for_age <- function(age_class) {
+    if (p$initial_prevalence_scope == "all_age_groups" || age_class == "cow")
+      p$init_prevalence
+    else
+      0
+  }
   
-  for (i in seq_len(p$init_calves)) {
+  for (s in initial_states(p$init_calves, prevalence_for_age("calf"))) {
     a <- h$new_animal(
       -runif(1, 0, p$calf_to_heifer_age),
       "calf",
-      "S"
+      s
     )
     
     schedule_age_up(sim, a)
+    if (s %in% c("I_L", "I_H"))
+      sim$ever_infected <- TRUE
   }
   
-  for (i in seq_len(p$init_heifers)) {
+  for (s in initial_states(p$init_heifers, prevalence_for_age("heifer"))) {
     a <- h$new_animal(
       -runif(
         1,
@@ -477,30 +544,15 @@ init_population <- function(sim) {
         p$heifer_to_cow_age
       ),
       "heifer",
-      "S"
+      s
     )
     
     schedule_age_up(sim, a)
+    if (s %in% c("I_L", "I_H"))
+      sim$ever_infected <- TRUE
   }
   
-  ni <- round(
-    p$init_cows * p$init_prevalence
-  )
-  
-  nl <- round(
-    ni * p$init_LH_ratio
-  )
-  
-  z <- c(
-    rep("S", p$init_cows - ni),
-    rep("I_L", nl),
-    rep("I_H", ni - nl)
-  )
-  
-  if (length(z) > 1)
-    z <- z[sample.int(length(z))]
-  
-  for (s in z) {
+  for (s in initial_states(p$init_cows, prevalence_for_age("cow"))) {
     h$new_animal(
       -runif(
         1,
@@ -513,6 +565,15 @@ init_population <- function(sim) {
     
     if (s %in% c("I_L", "I_H"))
       sim$ever_infected <- TRUE
+  }
+
+  if (!is.null(p$initial_infected_age)) {
+    ids <- h$members[[p$initial_infected_age]]$S$as_vector()
+    if (!length(ids))
+      stop("No susceptible animal in the requested initial age class.")
+    index_animal <- h$get_animal(ids[sample.int(length(ids), 1L)])
+    h$set_state(index_animal, p$initial_infected_state)
+    sim$ever_infected <- TRUE
   }
 }
 
@@ -558,17 +619,33 @@ corrective_factor <- function(sim) {
   max(0, 1 - efficacy)
 }
 
-foi <- function(sim, ac) {
+infectious_counts <- function(sim) {
   h <- sim$herd
-  n <- h$n_age(ac)
-  
-  if (!n)
-    return(0)
-  
-  corrective_factor(sim) * (
-    sim$p$beta_L[[ac]] * h$n_state(ac, "I_L") +
-      sim$p$beta_H[[ac]] * h$n_state(ac, "I_H")
-  ) / n
+  counts <- c(LInv=0L,HInv=0L,LIv=0L)
+  for (ac in AGE_CLASSES) {
+    counts[["LInv"]] <- counts[["LInv"]] + h$n_state(ac, "I_L")
+    counts[["HInv"]] <- counts[["HInv"]] + h$n_state(ac, "I_H")
+  }
+  counts
+}
+
+foi <- function(sim, i=infectious_counts(sim)) {
+  h <- sim$herd
+  n <- sum(vapply(AGE_CLASSES, h$n_age, integer(1)))
+  if (n == 0L) return(0)
+  p <- sim$p
+  x <- p$beta_Snv_LInv*i[["LInv"]] + p$beta_Snv_HInv*i[["HInv"]]
+  corrective_factor(sim) * x / n
+}
+
+susceptible_ids <- function(sim, ac) {
+  sim$herd$members[[ac]]$S$as_vector()
+}
+
+maternal_protected_ids <- function(sim) {
+  ids <- sim$herd$members$calf$R$as_vector()
+  ids[vapply(ids, function(id)
+    identical(sim$herd$get_animal(id)$r_source, "maternal"), logical(1))]
 }
 
 #14 stochastic event rates
@@ -619,26 +696,23 @@ stochastic_rates <- function(sim) {
   }
   
   r <- c(r, list(add(
-    h$n_age("cow") * p$birth_rate,
+    h$n_age("cow") * p$female_calf_entry_rate,
     "birth",
     "cow"
   )))
   
   if (!is.null(p$maternal_waning_rate)) {
     r <- c(r, list(add(
-      h$n_state("calf", "R") * p$maternal_waning_rate,
+      length(maternal_protected_ids(sim)) * p$maternal_waning_rate,
       "wane",
       "calf"
     )))
   }
   
-  for (ac in AGE_CLASSES) {
-    r <- c(r, list(add(
-      h$n_state(ac, "S") * foi(sim, ac),
-      "infect",
-      ac
-    )))
-  }
+  i <- infectious_counts(sim)
+  force <- foi(sim, i)
+  for (ac in AGE_CLASSES)
+    r <- c(r, list(add(h$n_state(ac,"S") * force, "infect", ac)))
   
   # Remove NULL entries
   Filter(Negate(is.null), r)
@@ -673,21 +747,14 @@ random_infected <- function(sim, ac) {
 
 #16 birth and vertical transmission
 do_birth_from_dam <- function(sim, dam) {
-  
-  if (runif(1) >= sim$p$prop_female) {
-    sim$acc$births_male <-
-      sim$acc$births_male + 1L
-    
-    return(invisible(NULL))
-  }
-  
+  # The event rate already represents live female calves entering the herd.
   sim$acc$births_female <-
     sim$acc$births_female + 1L
   
   if (dam$state %in% c("I_L", "I_H")) {
     
-    if (runif(1) < sim$p$vertical_transmission_rate) {
-      s <- dam$state
+    if (runif(1) < sim$p$perinatal_transmission_rate) {
+      s <- if (runif(1) < sim$p$init_LH_ratio) "I_L" else "I_H"
       src <- NULL
     } else {
       s <- "R"
@@ -729,14 +796,11 @@ do_birth <- function(sim) {
 
 do_infection <- function(sim, ac) {
   h <- sim$herd
-  a <- random_member(sim, ac, "S")
-  
-  nl <- h$n_state(ac, "I_L")
-  nh <- h$n_state(ac, "I_H")
-  
+  ids <- susceptible_ids(sim, ac)
+  a <- h$get_animal(ids[sample.int(length(ids), 1L)])
   h$set_state(
     a,
-    if (runif(1) < nl / (nl + nh))
+    if (runif(1) < sim$p$init_LH_ratio)
       "I_L"
     else
       "I_H"
@@ -749,10 +813,11 @@ do_infection <- function(sim, ac) {
 }
 
 #18 preventive vaccination -------------------------------------------------
-# Vaccine action is all-or-nothing.  Only S animals can become protected;
-# vaccination never changes I_L or I_H and vaccine protection does not wane.
+# A successful dose moves an eligible susceptible animal into permanently protected R.
+# A failed dose leaves the animal susceptible with its full original infection risk.
+# Previously infected animals are not vaccinated in this prevention model.
 vaccinate_animal <- function(sim, a) {
-  if (a$vaccinated)
+  if (a$vaccinated || a$state != "S")
     return(invisible(FALSE))
 
   a$vaccinated <- TRUE
@@ -760,8 +825,8 @@ vaccinate_animal <- function(sim, a) {
   sim$acc$vaccinated_by_age[[a$age_class]] <-
     sim$acc$vaccinated_by_age[[a$age_class]] + 1L
 
-  if (a$state == "S" && runif(1) < sim$p$vaccine_efficacy)
-    sim$herd$set_state(a, "R", r_source = "vaccine")
+  if (runif(1) < sim$p$vaccine_efficacy)
+    sim$herd$set_state(a, "R", r_source="vaccine")
 
   invisible(TRUE)
 }
@@ -769,7 +834,7 @@ vaccinate_animal <- function(sim, a) {
 maybe_vaccinate <- function(sim, a) {
   p <- sim$p
   if (!isTRUE(p$vaccination_enabled) || a$vaccinated || !a$alive ||
-      !(a$age_class %in% p$vaccination_groups))
+      !(a$age_class %in% p$vaccination_groups) || a$state != "S")
     return(invisible(FALSE))
 
   # Coverage is the probability that an eligible, not-yet-vaccinated animal
@@ -791,10 +856,27 @@ run_initial_vaccination_campaign <- function(sim) {
   invisible(NULL)
 }
 
-#19 replacement cow
-replace_cow <- function(sim, reason) {
+#19 replacement cow ----------------------------------------------------------
+# A cow vacancy is filled from the heifer group only by an animal in the
+# replacement window (22–24 months by default).  Younger heifers remain in the
+# heifer group.  If no eligible heifer is available, an external cow is bought.
+eligible_replacement_heifer_ids <- function(sim) {
   h <- sim$herd
   ids <- h$by_age$heifer$as_vector()
+  if (!length(ids)) return(integer(0))
+  ages <- vapply(ids, function(id) {
+    a <- h$get_animal(id)
+    sim$t - a$birth_time
+  }, numeric(1))
+  ids[
+    ages >= sim$p$replacement_heifer_min_age &
+      ages <= sim$p$replacement_heifer_max_age
+  ]
+}
+
+replace_cow <- function(sim, reason) {
+  h <- sim$herd
+  ids <- eligible_replacement_heifer_ids(sim)
   
   if (length(ids)) {
     bt <- vapply(
@@ -896,10 +978,10 @@ execute_stochastic <- function(sim, rates, total) {
     do_birth(sim)
   
   else if (event$kind == "wane")
-    h$set_state(
-      random_member(sim, "calf", "R"),
-      "S"
-    )
+    {
+      ids <- maternal_protected_ids(sim)
+      h$set_state(h$get_animal(ids[sample.int(length(ids), 1L)]), "S")
+    }
   
   else if (event$kind == "infect")
     do_infection(
@@ -926,11 +1008,12 @@ surveillance <- function(sim) {
     )
   )
   
-  found <- length(ids) > 0 &&
-    any(
-      runif(length(ids)) <
-        sim$p$surveillance_sensitivity
-    )
+  found <- any(vapply(ids, function(id) {
+    a <- h$get_animal(id)
+    sensitivity <- if (a$age_class == "calf")
+      sim$p$surveillance_sensitivity_calf else sim$p$surveillance_sensitivity_older
+    runif(1) < sensitivity
+  }, logical(1)))
   
   if (found)
     sim$consecutive_clean_samples <- 0L
@@ -1036,29 +1119,21 @@ handle_scheduled <- function(sim, kind, meta) {
       a$alive &&
       a$age_class == "heifer"
     ) {
-      total <- sum(
-        vapply(
-          AGE_CLASSES,
-          h$n_age,
-          integer(1)
-        )
-      )
-      
-      if (
-        isTRUE(sim$p$cap_herd_at_target) &&
-        total > sim$p$herd_size
-      ) {
-        h$remove_animal(a)
-        
-        sim$acc$heifers_sold_surplus <-
-          sim$acc$heifers_sold_surplus + 1L
-      } else {
+      # At 24 months, a heifer enters the cow group only if an adult-cow
+      # place is vacant.  Otherwise she is recorded as surplus and leaves
+      # the herd.  This prevents automatic promotion from inflating cow
+      # numbers and makes target_cows the active adult-herd target.
+      if (h$n_age("cow") < sim$p$target_cows) {
         h$set_age_class(
           a,
           "cow"
         )
 
         maybe_vaccinate(sim, a)
+      } else {
+        h$remove_animal(a)
+        sim$acc$heifers_sold_surplus <-
+          sim$acc$heifers_sold_surplus + 1L
       }
     }
   }
@@ -1120,7 +1195,9 @@ do_control_test <- function(sim) {
     sim$acc$tested_by_age[[a$age_class]] <-
       sim$acc$tested_by_age[[a$age_class]] + 1L
 
-    if (!(a$state %in% c("I_L", "I_H")) || runif(1) >= p$testing_sensitivity)
+    sensitivity <- if (a$age_class == "calf")
+      p$testing_sensitivity_calf else p$testing_sensitivity_older
+    if (!(a$state %in% c("I_L", "I_H")) || runif(1) >= sensitivity)
       next
 
     if (identical(p$testing_remove_policy, "high_only") && a$state != "I_H")
@@ -1217,11 +1294,11 @@ run_one <- function(params, seed = NULL) {
 }
 
 #27 seeds
-run_strategy <- function(params, n_runs, master_seed = 12345L) {
-  master_seed <- as.integer(master_seed)
-  set.seed(master_seed)
-  replicate_seeds <- sample.int(.Machine$integer.max, as.integer(n_runs))
 
+run_strategy <- function(params, n_runs, master_seed = 12345L) {
+  set.seed(master_seed)
+  replicate_seeds <- sample.int(.Machine$integer.max, n_runs)
+  
   list(
     n_runs = n_runs,
     master_seed = master_seed,

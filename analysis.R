@@ -1,5 +1,5 @@
 # Analysis is separated from the model. It has no automatic runs or plots.
-source("simulation.R")
+# Caller loads simulation.R before this file. Analysis functions are kept here.
 
 summarise_runs <- function(x) data.frame(
   replicate = seq_along(x$runs),
@@ -175,6 +175,11 @@ summarise_intervention_outcomes <- function(results) {
     mean_final_population = mean(final$final_population),
     median_time_to_eradication = if (all(is.na(eradication_times))) NA_real_ else
       stats::median(eradication_times, na.rm = TRUE),
+    mean_time_to_eradication_or_horizon = mean(ifelse(
+      is.na(eradication_times), results$runs[[1]]$year_records[[length(results$runs[[1]]$year_records)]]$time,
+      eradication_times)),
+    mean_time_among_eradicated_runs = if (all(is.na(eradication_times))) NA_real_ else
+      mean(eradication_times, na.rm=TRUE),
     mean_tests = mean(burden$tests),
     mean_test_positive_removed = mean(burden$test_positive_removed),
     mean_vaccinations = mean(burden$vaccinations),
