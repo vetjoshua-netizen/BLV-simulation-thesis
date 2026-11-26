@@ -276,3 +276,4 @@ if (length(completed_summaries)) {
 write_progress()
 message("Finished batch check. Completed scenarios: ", sum(progress$status %in% c("complete", "complete_existing")), " / ", nrow(scenario_grid))
 message("Results saved in: ", normalizePath(results_dir))
+

@@ -1,16 +1,12 @@
-# Explore infection after introducing one I_L or I_H animal into a disease-free herd.
-# Every yearly record retains the full calf/heifer/cow by disease-state structure
-# and annual demographic events, so that the eventual intervention start state
-# can be examined rather than inferred from whole-herd prevalence alone.
+
 source("simulation.R")
 
 herd_sizes <- c(100L, 200L, 800L)
 index_ages <- c("calf", "heifer", "cow")
 index_states <- c("I_L", "I_H")
 n_runs <- getOption("blv_burnin_n_runs", 100L)
-horizon_years <- 100L  # exploratory limit; review the curves before choosing the final period
+horizon_years <- 100L  
 master_seed <- 12345L
-# A scenario-specific runner can override these defaults with options().
 selected_scenario_ids <- getOption("blv_burnin_selected_scenario_ids", NULL)
 output_dir <- getOption("blv_burnin_output_dir",
                         file.path("results", "introduction_burnin_replacement"))
@@ -36,8 +32,7 @@ selected_indices <- if (is.null(selected_scenario_ids))
 if (anyNA(selected_indices))
   stop("Unknown scenario ID in selected_scenario_ids.")
 
-# The same list of replicate seeds is used for each scenario. Increasing n_runs
-# retains the earlier seed streams and adds new ones.
+
 set.seed(master_seed)
 replicate_seeds <- sample.int(.Machine$integer.max, n_runs)
 model_md5 <- unname(tools::md5sum("simulation.R"))
@@ -160,7 +155,7 @@ for (i in selected_indices) {
               " loaded")
     } else {
       elapsed <- system.time({
-        run <- run_one(params, replicate_seeds[j])
+        run <- run_one(params, replicate_seeds[j])  #run the simulation
         trajectory <- do.call(rbind, lapply(run$year_records, extract_year))
       })[["elapsed"]]
       # The final flush may repeat the horizon snapshot; keep its final state.
@@ -232,3 +227,9 @@ for (i in selected_indices) {
   print(summary_row)
 }
 
+options(
+  blv_burnin_n_runs=100L,
+  blv_burnin_output_dir=file.path("results", "introduction_burnin_replacement_100"),
+  blv_burnin_cache_dir=file.path("results", "introduction_burnin_replacement_pilot_20")
+)
+source("burnin_initialization.R")

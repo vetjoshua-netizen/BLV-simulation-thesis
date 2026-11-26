@@ -24,10 +24,8 @@ make_params <- function(
     init_calves=NULL,
     init_heifers=NULL,
     init_cows=NULL,
-    init_prevalence=.2,
+    init_prevalence=.2,#use 0,2 to run burnin, and use burnin result as real init_prevalence
     init_LH_ratio=.70,
-    # Defines whether init_prevalence is applied to cows only (legacy
-    # behaviour) or independently to each starting age class.
     initial_prevalence_scope="cows_only",
     female_calf_entry_rate=.38,
     calf_mortality_rate=.10,
@@ -45,29 +43,26 @@ make_params <- function(
     maternal_waning_rate=NULL,
     beta_Snv_LInv=.008722059 * 365,
     beta_Snv_HInv=.09607751 * 365,
-    beta_Sv_LInv=7.518942e-05,
-    beta_Sv_HInv=.0008282463,
-    beta_Snv_LIv=3.454594e-268,
-    beta_Sv_LIv=2.978069e-270,
+    beta_Sv_LInv=7.518942e-05 * 365,
+    beta_Sv_HInv=.0008282463 * 365,
+    beta_Snv_LIv=3.454594e-268 * 365,
+    beta_Sv_LIv=2.978069e-270 * 365,
     blv_mortality_rate=c(calf=0,heifer=0,cow=.05),
     external_replacements_tested=TRUE,
-    external_prevalence=.15,
-    external_LH_ratio=.5,
+    external_prevalence=.15, #doesnt matter
+    external_LH_ratio=.5, #doesnt matter
     surveillance_interval_years=.25,
     n_clean_samples_required=3L,
     cap_herd_at_target=TRUE,
 
     # Corrective management reduces the horizontal force of infection by the
-    # stated efficacy.  NULL means no corrective management.
     corrective_management=NULL,
-
-    corrective_management_efficacy=c(CM_0=0,CM_25=.25,CM_50=.50,CM_90=.90,CM_99=.99),
-
+    corrective_management_efficacy=c(CM_0=0,CM_25=.25,CM_50=.50,CM_90=.90,CM_99=.99), #tbc
+    
     # Test-and-remove intervention.
     testing_enabled=FALSE,
-
-    testing_interval_years=.5,
-    testing_target_group="all",
+    testing_interval_years=.5, #0.25; 0.50; 1.00
+    testing_target_group="all",  #all or ih
     testing_remove_policy="all_positive",
     testing_sensitivity_older=.95,
     testing_sensitivity_calf=.91,
@@ -918,6 +913,48 @@ replace_cow <- function(sim, reason) {
     sim$ever_infected <- TRUE
 }
 
+
+source("simulation.R")
+
+make_empty_sim <- function() {
+  p <- make_params(
+    herd_size=1L,
+    init_calves=0L,
+    init_heifers=0L,
+    init_cows=0L,
+    target_cows=1L,
+    horizon_years=1,
+    female_calf_entry_rate=0,
+    cow_culling_rate=0,
+    calf_mortality_rate=0,
+    heifer_mortality_rate=0,
+    blv_mortality_rate=c(calf=0, heifer=0, cow=0),
+    surveillance_interval_years=NULL
+  )
+  Simulation$new(p, seed=1L)
+}
+
+# Only the 23-month heifer is eligible; the 21-month heifer must remain a heifer.
+sim <- make_empty_sim()
+young <- sim$herd$new_animal(-21/12, "heifer", "S")
+eligible <- sim$herd$new_animal(-23/12, "heifer", "S")
+stopifnot(identical(eligible_replacement_heifer_ids(sim), eligible$id))
+invisible(replace_cow(sim, "test"))
+stopifnot(sim$herd$n_age("cow") == 1L,
+          sim$herd$get_animal(young$id)$age_class == "heifer",
+          sim$herd$get_animal(eligible$id)$age_class == "cow",
+          sim$acc$external_purchases == 0L)
+
+# With no eligible heifer, the missing cow is bought externally.
+sim <- make_empty_sim()
+invisible(sim$herd$new_animal(-21/12, "heifer", "S"))
+invisible(replace_cow(sim, "test"))
+stopifnot(sim$herd$n_age("cow") == 1L,
+          sim$herd$n_age("heifer") == 1L,
+          sim$acc$external_purchases == 1L)
+
+cat("Replacement-window checks passed.\n")
+
 #20 execute a stochastic event
 execute_stochastic <- function(sim, rates, total) {
   draw <- runif(1) * total
@@ -1342,4 +1379,7 @@ herd_indexes_consistent <- function(h) {
   
   TRUE
 }
+
+
+parallel::detectCores()
 
